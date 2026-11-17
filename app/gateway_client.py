@@ -24,14 +24,32 @@ def _exc_detail(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
+def _retry_after_seconds(response: httpx.Response, data: Any) -> float | None:
+    """Best-effort retry-after hint from a 429 body or header."""
+    if isinstance(data, dict):
+        raw = data.get("retry_after_seconds")
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return max(0.0, float(raw))
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return max(0.0, float(header))
+        except ValueError:
+            return None
+    return None
+
+
 @dataclass
 class GatewayResult:
-    # accepted | duplicate | failed | unknown
+    # accepted | duplicate | failed | unknown | throttled
     outcome: str
     gateway_status: str | None = None
     detail: str | None = None
     http_status: int | None = None
     raw: dict[str, Any] | None = None
+    # Only set for ``throttled``: seconds the gateway asked us to wait before
+    # retrying this contact.
+    retry_after_seconds: float | None = None
 
     @property
     def confirmed_accepted(self) -> bool:
@@ -104,6 +122,18 @@ class GatewayClient:
             return GatewayResult("accepted", "accepted", None, response.status_code, data)
         if response.status_code == 200 and gateway_status == "duplicate":
             return GatewayResult("duplicate", "duplicate", None, response.status_code, data)
+        if response.status_code == 429:
+            # Contact rate limit: the notification was NOT accepted. This is a
+            # "deliver later" signal, never a rejection — the caller must
+            # redeliver once the gateway's retry-after hint has elapsed.
+            return GatewayResult(
+                "throttled",
+                "rate_limited",
+                "gateway rate-limited this contact; will retry after the given delay",
+                response.status_code,
+                data,
+                _retry_after_seconds(response, data),
+            )
         if response.status_code == 307 and gateway_status == "slow_retry":
             # Gateway deliberately took too long; acceptance is not proven.
             return GatewayResult("unknown", "slow_retry", "gateway signalled slow retry", response.status_code, data)

@@ -402,6 +402,133 @@ class AlarmService:
                 (utc_now(), notification_id),
             )
 
+    def alarm_confirmed(self, alarm_no: str) -> bool:
+        row = self.db.query_one(
+            "SELECT confirmed_at FROM alarms WHERE alarm_no = ?", (alarm_no,)
+        )
+        return row is not None and row["confirmed_at"] is not None
+
+    def throttle_notification(
+        self,
+        notification_id: int,
+        *,
+        retry_at: float,
+        detail: str | None,
+    ) -> dict[str, Any] | None:
+        """Record a gateway 429 for a notification.
+
+        Rate limiting is *not* a rejection: the notification goes back to
+        ``pending`` and is redelivered once ``retry_at`` (the gateway's
+        retry-after hint) has elapsed. The clock is untouched — it still only
+        starts at a confirmed acceptance.
+
+        A backup whose alarm was confirmed while it waited for budget is
+        cancelled instead of being sent late: the confirmation came before the
+        actual send, so the page must not go out.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["state"] not in {"pending", "in_flight", "unknown"}:
+                # Already resolved (accepted/failed/cancelled) while the 429
+                # was in flight; the stored state wins.
+                return dict(row)
+
+            alarm = conn.execute(
+                "SELECT confirmed_at FROM alarms WHERE alarm_no = ?", (row["alarm_no"],)
+            ).fetchone()
+            if row["role"] == "backup" and alarm is not None and alarm["confirmed_at"] is not None:
+                history = self._append_history(
+                    row["history_json"],
+                    "cancelled",
+                    "alarm confirmed while the gateway rate-limited this notification",
+                )
+                conn.execute(
+                    """
+                    UPDATE notifications
+                       SET state = 'cancelled', gateway_status = 'rate_limited',
+                           detail = 'cancelled: alarm confirmed before the rate-limited delivery was sent',
+                           history_json = ?, next_attempt_at = NULL, lease_until = NULL,
+                           lookup_misses = 0
+                     WHERE id = ?
+                    """,
+                    (history, notification_id),
+                )
+                self._event(
+                    conn,
+                    row["alarm_no"],
+                    "backup_cancelled",
+                    f"{row['notification_no']}: confirmed while rate-limited; not sent",
+                )
+                return dict(
+                    conn.execute(
+                        "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+                    ).fetchone()
+                )
+
+            history = self._append_history(
+                row["history_json"],
+                "pending",
+                "gateway_status=rate_limited" + (f"; {detail}" if detail else ""),
+            )
+            conn.execute(
+                """
+                UPDATE notifications
+                   SET state = 'pending', gateway_status = 'rate_limited', detail = ?,
+                       history_json = ?, next_attempt_at = ?, lease_until = NULL,
+                       lookup_misses = 0
+                 WHERE id = ?
+                """,
+                (detail, history, retry_at, notification_id),
+            )
+            self._event(
+                conn,
+                row["alarm_no"],
+                f"{row['role']}_rate_limited",
+                f"{row['notification_no']}: {detail or 'rate limited'}",
+            )
+            return dict(
+                conn.execute(
+                    "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+                ).fetchone()
+            )
+
+    def cancel_notification(self, notification_id: int, detail: str) -> dict[str, Any] | None:
+        """Cancel a not-yet-accepted notification (used when the alarm was
+        confirmed before the notification ever reached the gateway)."""
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["state"] not in {"pending", "in_flight", "unknown"}:
+                return dict(row)
+            history = self._append_history(row["history_json"], "cancelled", detail)
+            conn.execute(
+                """
+                UPDATE notifications
+                   SET state = 'cancelled', detail = ?, history_json = ?,
+                       next_attempt_at = NULL, lease_until = NULL
+                 WHERE id = ?
+                """,
+                (detail, history, notification_id),
+            )
+            self._event(
+                conn,
+                row["alarm_no"],
+                f"{row['role']}_cancelled",
+                f"{row['notification_no']}: {detail}",
+            )
+            return dict(
+                conn.execute(
+                    "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+                ).fetchone()
+            )
+
     def mark_notification(
         self,
         notification_id: int,

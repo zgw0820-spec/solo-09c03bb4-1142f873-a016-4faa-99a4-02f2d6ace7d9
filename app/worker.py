@@ -245,7 +245,7 @@ class Dispatcher:
             notification_no=row["notification_no"],
             alarm_no=row["alarm_no"],
             role=row["role"],
-            contact=row["contact_json"],
+            contact=_load(row["contact_json"], {}),
             content_hash=row["content_hash"],
             payload=_load(row["payload_json"], {}),
         )
@@ -271,6 +271,19 @@ class Dispatcher:
             # one delivery.
             misses = int(row.get("lookup_misses") or 0) + 1
             if misses >= self.not_found_misses_before_repost:
+                if row["role"] == "backup" and self.service.alarm_confirmed(row["alarm_no"]):
+                    # The gateway never accepted this backup and the alarm is
+                    # already confirmed: the confirmation came before the
+                    # actual send, so cancel instead of re-posting.
+                    log.info(
+                        "notification %s: alarm confirmed before re-post; cancelling",
+                        row["notification_no"],
+                    )
+                    self.service.cancel_notification(
+                        row["id"],
+                        "alarm confirmed before delivery; gateway has no record of this notification",
+                    )
+                    return
                 log.info(
                     "notification %s absent from gateway after %d lookups; re-posting",
                     row["notification_no"],
@@ -299,6 +312,19 @@ class Dispatcher:
         await self._apply_result(row, result)
 
     async def _apply_result(self, row: dict[str, Any], result: GatewayResult) -> None:
+        if result.outcome == "throttled":
+            # 429 is "deliver later", not a rejection: park the notification as
+            # pending and redeliver once the gateway's retry-after hint has
+            # elapsed. No timer starts — the notification was not accepted.
+            delay = result.retry_after_seconds
+            if delay is None or delay <= 0:
+                delay = self.max_backoff_seconds
+            self.service.throttle_notification(
+                row["id"],
+                retry_at=time.time() + delay,
+                detail=result.detail,
+            )
+            return
         if result.outcome in {"accepted", "duplicate"}:
             self.service.mark_notification(
                 row["id"],

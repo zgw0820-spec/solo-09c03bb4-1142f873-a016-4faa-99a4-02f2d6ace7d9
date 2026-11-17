@@ -10,6 +10,8 @@ It exercises the paths that are hard to see in unit tests:
   2. submit -> escalate exactly once
   3. slow gateway: unknown receipt must not escalate; recovery must not double-page
   4. dropped receipt: gateway accepted, API must resolve via lookup, not re-post
+  5. same-alarm retry idempotency and 409 on changed content
+  6. per-contact rate limiting: 429 is redelivered, not lost; other contacts pass
 
 Exits non-zero on the first violated assertion. Run it with -I.
 """
@@ -48,12 +50,12 @@ def put_config(**config) -> None:
     assert status == 200, f"gateway config rejected: {status}"
 
 
-def payload(alarm_no: str, deadline: int = 2) -> dict:
+def payload(alarm_no: str, deadline: int = 2, primary_name: str = "主值班员 张工") -> dict:
     return {
         "alarm_no": alarm_no,
         "content": "供电柜 A07 温度 78°C，超过告警阈值",
         "metadata": {"cabinet": "A07"},
-        "primary_contact": {"name": "主值班员 张工", "channel": "app"},
+        "primary_contact": {"name": primary_name, "channel": "app"},
         "backup_contact": {"name": "备班 李工", "channel": "sms", "address": "+8613800000000"},
         "ack_deadline_seconds": deadline,
     }
@@ -82,7 +84,8 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    put_config(slow_ms=0, drop_receipt=False, reject=False)
+    # Scenarios 1-5 run with rate limiting off; scenario 6 enables it.
+    put_config(slow_ms=0, drop_receipt=False, reject=False, rate_limit_window_ms=0)
 
     print("[1] confirmation prevents escalation")
     status, body = call("POST", f"{API}/alarms", payload(f"{RUN}-CONFIRM", 3))
@@ -110,7 +113,7 @@ def main() -> int:
     check(len(records) == 1, "backup paged exactly once at the gateway")
 
     print("[3] dropped receipt: no false escalation, recovery does not re-page")
-    put_config(slow_ms=0, drop_receipt=True, drop_hold_ms=2500)
+    put_config(slow_ms=0, drop_receipt=True, drop_hold_ms=2500, rate_limit_window_ms=0)
     call("POST", f"{API}/alarms", payload(f"{RUN}-DROP", 2))
     view = wait_for(
         f"{RUN}-DROP",
@@ -124,7 +127,7 @@ def main() -> int:
     check(view["primary_accepted_at"] is not None, "receipt resolved via gateway lookup")
     primaries = [r for r in gateway_records(f"{RUN}-DROP") if r["role"] == "primary"]
     check(len(primaries) == 1, "receipt recovery did not duplicate the primary page")
-    put_config(slow_ms=0, drop_receipt=False, reject=False)
+    put_config(slow_ms=0, drop_receipt=False, reject=False, rate_limit_window_ms=0)
 
     print("[4] same alarm retry is idempotent; changed content is rejected")
     status, _ = call("POST", f"{API}/alarms", payload(f"{RUN}-CONFIRM", 3))
@@ -139,6 +142,31 @@ def main() -> int:
     notification_no = view["notifications"][0]["notification_no"]
     status, single = call("GET", f"{API}/notifications/{notification_no}")
     check(status == 200 and single["notification_no"] == notification_no, "lookup by notification number")
+
+    print("[6] per-contact rate limit: 429 is redelivered, other contacts pass")
+    put_config(slow_ms=0, drop_receipt=False, reject=False,
+               rate_limit_window_ms=1500, rate_limit_max=1)
+    # Two alarms for the same contact back to back: the second is throttled.
+    call("POST", f"{API}/alarms", payload(f"{RUN}-RL-1", 5, primary_name="限流联系人"))
+    wait_for(f"{RUN}-RL-1", lambda v: v["status"] == "awaiting_confirmation")
+    call("POST", f"{API}/alarms", payload(f"{RUN}-RL-2", 5, primary_name="限流联系人"))
+    call("POST", f"{API}/alarms", payload(f"{RUN}-RL-3", 5, primary_name="其他联系人"))
+    view = wait_for(
+        f"{RUN}-RL-2",
+        lambda v: v["notifications"][0]["gateway_status"] == "rate_limited"
+        or v["primary_accepted_at"] is not None,
+    )
+    view = wait_for(f"{RUN}-RL-2", lambda v: v["status"] == "awaiting_confirmation")
+    check(view["primary_accepted_at"] is not None, "throttled notification was redelivered")
+    view3 = wait_for(f"{RUN}-RL-3", lambda v: v["status"] == "awaiting_confirmation")
+    check(view3["primary_accepted_at"] is not None, "other contact delivered during the limit window")
+    rl_records = [
+        r
+        for r in gateway_records(f"{RUN}-RL-1") + gateway_records(f"{RUN}-RL-2")
+        if r["role"] == "primary"
+    ]
+    check(len(rl_records) == 2, "both same-contact notifications delivered exactly once")
+    put_config(slow_ms=0, drop_receipt=False, reject=False, rate_limit_window_ms=0)
 
     print("smoke test passed")
     return 0

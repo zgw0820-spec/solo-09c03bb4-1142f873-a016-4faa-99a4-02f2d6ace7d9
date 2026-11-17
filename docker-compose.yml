@@ -8,6 +8,10 @@ services:
       GATEWAY_SLOW_MS: "0"
       GATEWAY_DROP_RECEIPT: "0"
       GATEWAY_REJECT: "0"
+      # Per-contact rate limit: at most one new notification per contact in any
+      # sliding 3s window; excess gets 429 with a retry-after hint.
+      RATE_LIMIT_WINDOW_MS: "3000"
+      RATE_LIMIT_MAX: "1"
       GATEWAY_STATE_PATH: /srv/data/gateway.json
     volumes:
       - gateway-data:/srv/data

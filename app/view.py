@@ -47,6 +47,10 @@ def _load(raw: str | None, default: Any) -> Any:
 def _notification_view(row: dict[str, Any], confirmed_at: str | None) -> dict[str, Any]:
     state = row["state"]
     display, display_text = NOTIFICATION_DISPLAY.get(state, (state, state))
+    if state == "pending" and row.get("gateway_status") == "rate_limited":
+        # Still queued, but explicitly waiting out the gateway's per-contact
+        # budget; it will be redelivered, not dropped.
+        display, display_text = "rate_limited", "网关限流，待补送"
     accepted_at = row.get("accepted_at")
 
     delivered_after_confirmation = bool(
@@ -119,10 +123,22 @@ def build_alarm_view(
 
     if primary is not None and primary["state"] in {"pending", "in_flight", "unknown"}:
         warnings.append("主通知尚未获得网关受理回执，确认计时尚未开始；回执不明不会被当作已送达。")
+    if (
+        primary is not None
+        and primary["state"] == "pending"
+        and primary.get("gateway_status") == "rate_limited"
+    ):
+        warnings.append("主通知被网关按联系人限流，将按网关给的可重试时间自动补送；确认计时自实际受理起算。")
     if primary is not None and primary["state"] == "unknown":
         warnings.append("主通知回执不明，正在向网关查询受理结果；查明前不会触发升级。")
     if primary is not None and primary["state"] == "failed":
         warnings.append("网关明确拒收主通知，系统不会自动重发，请人工核实主备联系人。")
+    if (
+        backup is not None
+        and backup["state"] == "pending"
+        and backup.get("gateway_status") == "rate_limited"
+    ):
+        warnings.append("备班通知被网关按联系人限流，将按可重试时间补送；若告警先被确认，补送会被取消。")
     if backup is not None and backup["state"] in {"in_flight", "unknown"}:
         warnings.append("备班通知已提交且在途，受理结果正在向网关查明，请以查询结果为准。")
     if (
